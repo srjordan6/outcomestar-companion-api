@@ -2,10 +2,9 @@
 # Endpoints:
 #   POST /v1/auth/extension-pair             redeem pairing code -> api_token
 #   GET  /v1/extension/enrollments           list student_external_identifiers for token's tenant
-#   POST /v1/extension/external-data-import  receive scraped payload, insert events
-# Auth: Bearer token; token validated against api_tokens.token_hash (sha256).
-# RLS: app.current_tenant_id set per-request from token's tenant_id.
-# v0.4.0 (2026-06-26): initial.
+#   POST /v1/extension/external-data-import  receive race payload, insert events
+#   POST /v1/extract/paste                   parse pasted race text into RaceInput[]  (NEW v0.5.0)
+# v0.5.0 (2026-06-27): paste-text extraction added; extension architecture deprecated.
 
 import os
 import re
@@ -21,7 +20,7 @@ from fastapi import FastAPI, APIRouter, Depends, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-API_VERSION = "0.4.0"
+API_VERSION = "0.5.0"
 STEPHEN_USER_ID = "019ed384-56d8-77fb-bfe6-00b1d064da18"
 
 COURSE_MAP = {"L": "LCM", "S": "SCM", "Y": "SCY"}
@@ -135,6 +134,21 @@ class ImportResponse(BaseModel):
     total: int
     student_id: str
     errors: list[str]
+
+class ExtractPasteRequest(BaseModel):
+    raw_text: str
+    meet_name: Optional[str] = None
+    meet_dates: Optional[str] = None
+
+class ExtractedSkip(BaseModel):
+    line: str
+    reason: str
+
+class ExtractPasteResponse(BaseModel):
+    extracted: list[RaceInput]
+    skipped: list[ExtractedSkip]
+    total_lines: int
+    extracted_count: int
 
 def parse_event(raw_event):
     if not raw_event:
@@ -251,6 +265,67 @@ def build_source_id(meet_start, distance, stroke_short, course_long, swim_time, 
         s += "p"
     return s
 
+# Regex patterns for paste extraction.
+# Tolerates tabs, spaces, en/em dashes, mixed column orders.
+EVENT_PATTERN = re.compile(
+    r"(?<!\d)(\d{2,4})\s*([LSY])?\s*(Free(?:style)?|Back(?:stroke)?|Breast(?:stroke)?|Fly|Butterfly|IM|Medley(?:\s*Relay)?(?:\s*\([A-Za-z]+\))?)",
+    re.IGNORECASE,
+)
+TIME_PATTERN = re.compile(r"\b(\d{1,2}:\d{2}:\d{2}\.\d{2}|\d{1,2}:\d{2}\.\d{2}|\d{2,3}\.\d{2})\b")
+PLACE_PATTERN = re.compile(r"\b(\d+)(st|nd|rd|th)\b", re.IGNORECASE)
+ROUND_PATTERN = re.compile(r"\b(Prelims|Finals|Timed Finals|Swim-off|Swim Off|Heats?)\b", re.IGNORECASE)
+IMPROVEMENT_PATTERN = re.compile(r"(?<![\d.])([+\-])(\d{1,2}:\d{2}\.\d{2}|\d{1,3}\.\d{2})\b")
+PB_PATTERN = re.compile(r"\b(PB|Personal Best|Lifetime Best|LB|Best)\b", re.IGNORECASE)
+HEADER_PATTERN = re.compile(r"^\s*(event|time|place|date|meet|round|improvement|best)\s*$", re.IGNORECASE)
+
+def extract_races_from_text(raw_text: str, meet_name: Optional[str], meet_dates: Optional[str]) -> tuple[list[RaceInput], list[ExtractedSkip]]:
+    extracted: list[RaceInput] = []
+    skipped: list[ExtractedSkip] = []
+    if not raw_text or not raw_text.strip():
+        return extracted, skipped
+    # Normalize whitespace within lines but preserve newlines
+    lines = [ln.strip() for ln in raw_text.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+    lines = [ln for ln in lines if ln]
+    for ln in lines:
+        # Skip obvious header lines (single column header)
+        if HEADER_PATTERN.match(ln):
+            skipped.append(ExtractedSkip(line=ln, reason="header"))
+            continue
+        event_match = EVENT_PATTERN.search(ln)
+        time_match = TIME_PATTERN.search(ln)
+        if not (event_match and time_match):
+            # Not a race row — could be meet header, blank, or text
+            if event_match or time_match:
+                skipped.append(ExtractedSkip(line=ln, reason="incomplete: needs both event and time"))
+            else:
+                skipped.append(ExtractedSkip(line=ln, reason="no event/time pattern"))
+            continue
+        raw_event = event_match.group(0).strip()
+        raw_time = time_match.group(1)
+        # Place
+        place_match = PLACE_PATTERN.search(ln)
+        raw_place = f"{place_match.group(1)}{place_match.group(2).lower()}" if place_match else None
+        # Round
+        round_match = ROUND_PATTERN.search(ln)
+        raw_round = round_match.group(1) if round_match else None
+        # Improvement
+        imp_match = IMPROVEMENT_PATTERN.search(ln)
+        improvement = f"{imp_match.group(1)}{imp_match.group(2)}" if imp_match else None
+        # PB flag
+        is_pb = bool(PB_PATTERN.search(ln))
+        extracted.append(RaceInput(
+            raw_event=raw_event,
+            raw_round=raw_round,
+            raw_time=raw_time,
+            raw_place=raw_place,
+            is_personal_best=is_pb,
+            improvement=improvement,
+            raw_row_text=ln[:250],
+            meet_name=meet_name,
+            meet_dates=meet_dates,
+        ))
+    return extracted, skipped
+
 async def authenticate(authorization: Annotated[Optional[str], Header()] = None):
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
@@ -282,6 +357,19 @@ async def authenticate(authorization: Annotated[Optional[str], Header()] = None)
 @app.get("/")
 async def health():
     return {"status": "ok", "service": "outcomestar-companion-api", "version": API_VERSION}
+
+@router.post("/v1/extract/paste", response_model=ExtractPasteResponse, tags=["extract"])
+async def extract_paste(req: ExtractPasteRequest):
+    # Parser-only endpoint. No auth, no DB writes. Pure text-to-RaceInput[] transform.
+    # Frontend posts pasted text, gets back structured rows for review, then user
+    # confirms via the existing /v1/extension/external-data-import endpoint.
+    extracted, skipped = extract_races_from_text(req.raw_text, req.meet_name, req.meet_dates)
+    return ExtractPasteResponse(
+        extracted=extracted,
+        skipped=skipped,
+        total_lines=len([ln for ln in req.raw_text.replace("\r\n", "\n").split("\n") if ln.strip()]),
+        extracted_count=len(extracted),
+    )
 
 @router.post("/v1/auth/extension-pair", response_model=PairResponse, tags=["extension"])
 async def extension_pair(req: PairRequest):
