@@ -9,7 +9,7 @@ workflows:
         - 'actions/checkout@v4.4.0'
         - 'aquasecurity/trivy-action@master'
         - 'github/codeql-action@v3.39.0'
-        - 'gitleaks/gitleaks-action@v2.3.9'
+        - 'gitleaks/gitleaks-action@v3.0.0'
 dependencies:
     'actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9':
         ref: 'v6.1.0'
@@ -52,8 +52,8 @@ dependencies:
         commit: 'sha1-ce5e7eeac396d720fe2d802714996c8ce561e311'
         owner_id: 9919
         repo_id: 259445878
-    'gitleaks/gitleaks-action@v2.3.9':
-        ref: 'v2.3.9'
-        commit: 'sha1-ff98106e4c7b2bc287b24eaf42907196329070c7'
+    'gitleaks/gitleaks-action@v3.0.0':
+        ref: 'v3.0.0'
+        commit: 'sha1-e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e'
         owner_id: 90395851
         repo_id: 242854909
